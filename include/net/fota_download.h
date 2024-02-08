@@ -170,6 +170,14 @@ int fota_download_target(void);
  */
 int fota_download_s0_active_get(bool *const s0_active);
 
+/**@brief Get fota download attempt count.
+ *
+ *  Returns -1 before download starts.
+ *
+ * @retval -1 before download starts. Count thereafter.
+ */
+int fota_download_get_attempt_count(void);
+
 #ifdef __cplusplus
 }
 #endif

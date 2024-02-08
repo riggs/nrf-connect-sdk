@@ -1214,10 +1214,18 @@ reset:
 	goto start;
 }
 
+/*
+ * To update this patch go to kt/src/embedded/ff/extern/ncs/nrf/ and run git fetch
+ * followed by git checkout main. Make changes to subsys/net/lib/aws_iot/src/aws_iot.c
+ * and then run the command:
+ * git diff subsys/net/lib/aws_iot/src/aws_iot.c > ../../../extern_patches/patches_aws_iot/0001-aws_iot_c.patch
+ * Commit the updated version of 0001-aws_iot_c.patch to ktmr.
+ */
+
 #ifdef CONFIG_BOARD_QEMU_X86
 #define POLL_THREAD_STACK_SIZE 4096
 #else
-#define POLL_THREAD_STACK_SIZE 3072
+#define POLL_THREAD_STACK_SIZE 4096
 #endif
 K_THREAD_DEFINE(aws_connection_poll_thread, POLL_THREAD_STACK_SIZE,
 		aws_iot_cloud_poll, NULL, NULL, NULL,

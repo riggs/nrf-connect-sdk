@@ -12,6 +12,14 @@
  *
  */
 
+/*
+ * To update this patch go to kt/src/embedded/ff/extern/ncs/nrf/ and run git fetch
+ * followed by git checkout main. Make changes to subsys/net/lib/aws_fota/include/aws_fota_json.h
+ * and then run the command:
+ * git diff subsys/net/lib/aws_fota/include/aws_fota_json.h > ../../../extern_patches/patches_aws_fota/0001-aws_fota_json_h.patch
+ * Commit the updated version of 0001-aws_fota_json_h.patch to ktmr.
+ */
+
 #ifndef AWS_FOTA_JSON_H__
 #define AWS_FOTA_JSON_H__
 
@@ -61,7 +69,9 @@ int aws_fota_parse_DescribeJobExecution_rsp(const char *job_document,
 					    char *job_id_buf,
 					    char *hostname_buf,
 					    char *file_path_buf,
-					    int *version_number);
+					    int *version_number,
+					    bool* mark_job_as_complete,
+					    bool* mark_job_as_failed);
 
 /**
  * @brief Parse a Job Execution accepted response object. Returned by a call to

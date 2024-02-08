@@ -37,7 +37,7 @@ LOG_MODULE_REGISTER(fota_download, CONFIG_FOTA_DOWNLOAD_LOG_LEVEL);
 static fota_download_callback_t callback;
 static struct download_client   dlc;
 static struct k_work_delayable  dlc_with_offset_work;
-static int socket_retries_left;
+static int socket_retries_left = -1;
 #ifdef CONFIG_DFU_TARGET_MCUBOOT
 static uint8_t mcuboot_buf[CONFIG_FOTA_DOWNLOAD_MCUBOOT_FLASH_BUF_SZ] __aligned(4);
 #endif
@@ -508,4 +508,14 @@ int fota_download_cancel(void)
 int fota_download_target(void)
 {
 	return img_type;
+}
+
+int fota_download_get_attempt_count(void)
+{
+	int ret = -1;
+	if ((socket_retries_left >= 0) && (socket_retries_left <= CONFIG_FOTA_SOCKET_RETRIES))
+	{
+		ret = CONFIG_FOTA_SOCKET_RETRIES - socket_retries_left;
+	}
+	return ret;
 }

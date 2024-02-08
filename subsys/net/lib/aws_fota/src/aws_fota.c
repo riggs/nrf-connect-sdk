@@ -4,6 +4,14 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
+/*
+ * To update this patch go to kt/src/embedded/ff/extern/ncs/nrf/ and run git fetch
+ * followed by git checkout main. Make changes to subsys/net/lib/aws_fota/src/aws_fota.c
+ * and then run the command:
+ * git diff subsys/net/lib/aws_fota/src/aws_fota.c > ../../../extern_patches/patches_aws_fota/0001-aws_fota.patch
+ * Commit the updated version of 0001-aws_fota.patch to ktmr.
+ */
+
 #include <zephyr/kernel.h>
 #include <stdio.h>
 #include <zephyr/data/json.h>
@@ -11,12 +19,17 @@
 #include <net/aws_jobs.h>
 #include <net/aws_fota.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/reboot.h>
+#include <hal/nrf_power.h>
+#include <drivers/eeprom.h>
 
 #include "aws_fota_json.h"
 
 LOG_MODULE_REGISTER(aws_fota, CONFIG_AWS_FOTA_LOG_LEVEL);
 
 #define AWS_JOB_ID_DEFAULT "INVALID-JOB-ID"
+
+#define EEPROM_ADDR_REBOOT_REASON (184)	// See: ff_definitions.h in ff project
 
 static enum internal_state {
 	STATE_UNINIT,
@@ -224,6 +237,8 @@ static int get_job_execution(struct mqtt_client *const client,
 			     uint32_t payload_len)
 {
 	int err;
+	bool mark_job_as_complete = false;
+	bool mark_job_as_failed = false;
 	int execution_version_number_prev = execution_version_number;
 	uint8_t job_id_incoming[AWS_JOBS_JOB_ID_MAX_LEN];
 
@@ -245,7 +260,9 @@ static int get_job_execution(struct mqtt_client *const client,
 	err = aws_fota_parse_DescribeJobExecution_rsp(payload_buf, payload_len,
 						      job_id_incoming, hostname,
 						      file_path,
-						      &execution_version_number);
+						      &execution_version_number,
+							  &mark_job_as_complete,
+							  &mark_job_as_failed);
 
 	if (err < 0) {
 		LOG_ERR("Error when parsing the json: %d", err);
@@ -254,6 +271,8 @@ static int get_job_execution(struct mqtt_client *const client,
 		LOG_DBG("Got only one field");
 		LOG_DBG("No queued jobs for this device");
 		return 0;
+	} else if (err == 1) {
+		LOG_DBG("Not a FOTA job, continuing...");
 	}
 
 	/* Check if the incoming job is already being handled. */
@@ -281,6 +300,34 @@ static int get_job_execution(struct mqtt_client *const client,
 	}
 
 	LOG_DBG("Subscribed to FOTA update topic %s", (char *)update_topic);
+
+	enum execution_status exe_status;
+
+	if (mark_job_as_complete)
+	{
+		LOG_ERR("Marking Job as Complete jobid %s", job_id_handling);
+		exe_status = AWS_JOBS_SUCCEEDED;
+	}
+
+	if (mark_job_as_failed)
+	{
+		LOG_ERR("Marking Job as Failed jobid %s", job_id_handling);
+		exe_status = AWS_JOBS_FAILED;
+	}
+
+	if (mark_job_as_complete || mark_job_as_failed)
+	{
+		err = update_job_execution(client_internal, job_id_handling, sizeof(job_id_handling), exe_status, "");
+
+		if (err < 0)
+			goto cleanup;
+
+		// Stop the execution of this job so we don't download the firmware
+		struct aws_fota_event aws_fota_evt = { .id = AWS_FOTA_EVT_ERROR	};
+		callback(&aws_fota_evt);
+		reset_library();
+	}
+
 	return 0;
 
 cleanup:
@@ -323,6 +370,17 @@ static int job_update_accepted(struct mqtt_client *const client,
 			.id = AWS_FOTA_EVT_START
 		};
 
+		if (strncmp(job_id_handling, "bulk-reboot", strlen("bulk-reboot")) == 0)
+		{
+			// If the job id is "bulk-reboot", update the status to complete and return
+			internal_state_set(STATE_DOWNLOAD_COMPLETE);
+
+			return update_job_execution(client,
+										job_id_handling,
+										sizeof(job_id_handling),
+										AWS_JOBS_SUCCEEDED, "");
+		}
+
 		LOG_DBG("Start downloading firmware from %s/%s",
 			(char *)hostname, (char *)file_path);
 
@@ -351,8 +409,32 @@ static int job_update_accepted(struct mqtt_client *const client,
 			.id = AWS_FOTA_EVT_DONE
 		};
 
+		if (strncmp(job_id_handling, "bulk-reboot", strlen("bulk-reboot")) == 0)
+		{
+			// Once the bulk-reboot job was marked as succeeded on AWS, reboot the system
+			int eeprom_val = 1;
+
+			const struct device *eeprom_dev = device_get_binding("EEPROM_0");
+
+			if (eeprom_dev == NULL)
+			{
+				LOG_ERR("Could not get EEPROM device\n");
+			}
+			else
+			{
+				if (eeprom_write(eeprom_dev, EEPROM_ADDR_REBOOT_REASON, &eeprom_val, sizeof(eeprom_val)) != 0)
+				{
+					LOG_ERR("Failed to write reboot reason to EEPROM");
+				}
+			}
+
+			LOG_INF("System is rebooting!");
+			sys_reboot(SYS_REBOOT_COLD);
+
+			break;
+		}
+
 		LOG_DBG("Job document was updated with status SUCCEEDED");
-		LOG_DBG("Ready to reboot");
 		callback(&aws_fota_evt);
 
 		/* Job is compeleted, reset library. */
