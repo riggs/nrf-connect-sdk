@@ -37,7 +37,9 @@ LOG_MODULE_REGISTER(fota_download, CONFIG_FOTA_DOWNLOAD_LOG_LEVEL);
 static fota_download_callback_t callback;
 static struct download_client   dlc;
 static struct k_work_delayable  dlc_with_offset_work;
-static int socket_retries_left;
+static int socket_retries_left = -1;
+static int download_retries_left = -1;
+static bool b_device_is_line_powered = false;
 #ifdef CONFIG_DFU_TARGET_MCUBOOT
 static uint8_t mcuboot_buf[CONFIG_FOTA_DOWNLOAD_MCUBOOT_FLASH_BUF_SZ] __aligned(4);
 #endif
@@ -45,6 +47,29 @@ static enum dfu_target_image_type img_type;
 static enum dfu_target_image_type img_type_expected = DFU_TARGET_IMAGE_TYPE_ANY;
 static bool first_fragment;
 static bool downloading;
+static bool suspended;
+
+// Validate that environment is good enough to resume download.
+static bool download_criteria_met (void)
+{
+	bool ret = true;
+	if ((socket_retries_left <= 0) && (download_retries_left <= 0))
+	{
+		ret = false;
+	}
+
+	if (true == ret)
+	{
+		// Check RSRP?
+	}
+
+	if (true == ret)
+	{
+		// Check BATTERY
+	}
+
+	return ret;
+}
 
 static void send_evt(enum fota_download_evt_id id)
 {
@@ -228,18 +253,48 @@ static int download_client_callback(const struct download_client_evt *event)
 		/* In case of socket errors we can return 0 to retry/continue,
 		 * or non-zero to stop
 		 */
-		if ((socket_retries_left) && ((event->error == -ENOTCONN) ||
-					      (event->error == -ECONNRESET) ||
-					      (event->error == -ETIMEDOUT))) {
-			LOG_WRN("Download socket error. %d retries left...",
-				socket_retries_left);
-			socket_retries_left--;
-			/* Fall through and return 0 below to tell
-			 * download_client to retry
-			 */
-		} else {
+		bool b_continue = false;
+
+		if (((event->error == -ENOTCONN) ||
+				 (event->error == -ECONNRESET) ||
+				 (event->error == -ETIMEDOUT)))
+		{
+			if (socket_retries_left > 0)
+			{
+				LOG_WRN("Download socket error. %d retries left...", socket_retries_left);
+				socket_retries_left--;
+				b_continue = true;
+				/* Fall through and return 0 below to tell
+				 * download_client to retry
+				 */
+			}
+			else if ((b_device_is_line_powered == true) && (download_retries_left > 0))
+			{
+				// Line powered, so do not suspend, just continue.
+				// Reset counters as pause resume would.
+				LOG_ERR("Download err: %d, Cable Power - CONTINUE.", event->error);
+				b_continue = true;
+				socket_retries_left = CONFIG_FOTA_SOCKET_RETRIES;
+				download_retries_left = download_retries_left - 1;
+			}
+			else if ((b_device_is_line_powered == false) && (download_retries_left > 0))
+			{
+					// On battery, and download retries remain, so perform a suspend of the download.
+					LOG_ERR("Download err: %d, Batt Power - SUSPEND.", event->error);
+					if (fota_download_suspend() >= 0)
+					{
+						b_continue = true;
+					}
+			}
+		}
+
+		// Trigger failure if not continuing with download.
+		if (b_continue == false)
+		{
+			// Fail
 			download_client_disconnect(&dlc);
-			LOG_ERR("Download client error");
+
+			LOG_ERR("Download client error: %d -- FAIL download.", event->error);
 			err = dfu_target_done(false);
 			if (err == -EACCES) {
 				LOG_DBG("No DFU target was initialized");
@@ -252,6 +307,7 @@ static int download_client_callback(const struct download_client_evt *event)
 			/* Return non-zero to tell download_client to stop */
 			return event->error;
 		}
+
 	}
 	default:
 		break;
@@ -392,6 +448,7 @@ int fota_download_start_with_image_type(const char *host, const char *file,
 	}
 
 	socket_retries_left = CONFIG_FOTA_SOCKET_RETRIES;
+	download_retries_left = CONFIG_FOTA_DOWNLOAD_RETRIES;
 
 	strncpy(file_buf, file, sizeof(file_buf) - 1);
 	file_buf[sizeof(file_buf) - 1] = '\0';
@@ -505,7 +562,131 @@ int fota_download_cancel(void)
 	return err;
 }
 
+/*
+Theoretically we should be albe to leverage the download client.
+var is dlc
+
+int download_client_start(struct download_client *client, const char *file, size_t from)
+Download a file.
+The download is carried out in fragments of up to CONFIG_DOWNLOAD_CLIENT_HTTP_FRAG_SIZE bytes for HTTP, or CONFIG_DOWNLOAD_CLIENT_COAP_BLOCK_SIZE bytes for CoAP, which are delivered to the application via DOWNLOAD_CLIENT_EVT_FRAGMENT events.
+Parameters
+:
+client – [in] Client instance.
+file – [in] File to download, null-terminated.
+from – [in] Offset from where to resume the download, or zero to download from the beginning.
+Return values
+int – Zero on success, a negative error code otherwise.
+
+__________
+
+int download_client_disconnect(struct download_client *client)
+Initiate disconnection.
+Request client to disconnect from the server. This does not block. When client have been disconnected, it send DOWNLOAD_CLIENT_EVT_CLOSED event.
+Request client to disconnect from the server. This does not block. When client has been disconnected, it sends DOWNLOAD_CLIENT_EVT_CLOSED event.
+Parameters
+:
+client – [in] Client instance.
+Returns
+:
+Zero on success, a negative error code otherwise.
+
+
+*/
+
+
+// static int reconnect(struct download_client *dl)
+// {
+// 	int err;
+//
+// 	LOG_INF("Reconnecting..");
+// 	err = download_client_disconnect(dl);
+// 	if (err) {
+// 		return err;
+// 	}
+//
+// 	err = download_client_connect(dl, dl->host, &dl->config);
+// 	if (err) {
+// 		return err;
+// 	}
+//
+// 	return 0;
+// }
+
+
+int fota_download_suspend(void)
+{
+	int ret = -EAGAIN;
+	LOG_INF("FOTA download SUSPEND request");
+	if (false == suspended)
+	{
+		suspended = true;
+		k_work_cancel_delayable(&dlc_with_offset_work);
+		send_evt(FOTA_DOWNLOAD_EVT_SUSPENDED);
+		download_client_pause(&dlc);
+		k_work_schedule(&dlc_with_offset_work, K_SECONDS(3));
+		ret = 0;
+	}
+	else
+	{
+			LOG_INF("Already suspended, no action.");
+	}
+	return ret;
+}
+
+int fota_download_resume(void)
+{
+	LOG_INF("FOTA download RESUME request");
+	int ret = -EAGAIN;
+	if (true == suspended)
+	{
+		// Reset the http_attempts counter.
+		socket_retries_left = CONFIG_FOTA_SOCKET_RETRIES;
+		// Consume one job attempt.
+		download_retries_left = download_retries_left - 1;
+
+		LOG_DBG("SOCK RETRIES LEFT: %d -- DOWNLOAD RETRIES LEFT: %d", socket_retries_left, download_retries_left);
+
+		suspended = false;
+		// Validate Criteria
+		if (true == download_criteria_met())
+		{
+			// Resume the download.
+			LOG_INF("Download Resume!");
+			download_client_resume(&dlc);
+			send_evt(FOTA_DOWNLOAD_EVT_RESUMED);
+			ret = 0;
+		}
+		else
+		{
+			LOG_INF("Download CANCEL!");
+			fota_download_cancel();
+			ret = -ECONNREFUSED;
+		}
+	}
+	else
+	{
+		LOG_INF("Download not suspended, no action.");
+	}
+	return ret;
+}
+
 int fota_download_target(void)
 {
 	return img_type;
+}
+
+int fota_download_get_attempt_count(void)
+{
+	int ret = -1;
+	if ((download_retries_left >= 0) && (download_retries_left <= CONFIG_FOTA_DOWNLOAD_RETRIES))
+	{
+		ret = CONFIG_FOTA_DOWNLOAD_RETRIES - download_retries_left;
+	}
+	return ret;
+}
+
+int fota_inform_ext_power_status(bool b_is_connected)
+{
+	b_device_is_line_powered = b_is_connected;
+	return 0;
 }

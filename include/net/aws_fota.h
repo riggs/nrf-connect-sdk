@@ -21,13 +21,27 @@
 extern "C" {
 #endif
 
-enum aws_fota_evt_id {
+enum internal_state_t
+{
+	AWS_FOTA_STATE_UNINIT = 0,
+	AWS_FOTA_STATE_INIT = 1,
+	AWS_FOTA_STATE_DOWNLOADING = 2,
+	AWS_FOTA_STATE_SUSPENDED = 3,
+	AWS_FOTA_STATE_DOWNLOAD_COMPLETE = 4,
+};
+
+enum aws_fota_evt_id
+{
 	/** AWS FOTA has started */
 	AWS_FOTA_EVT_START,
 	/** AWS FOTA complete and status reported to job document */
 	AWS_FOTA_EVT_DONE,
 	/** AWS FOTA error */
 	AWS_FOTA_EVT_ERROR,
+	// SUSPEND
+	AWS_FOTA_EVT_SUSPEND,
+	// Resumed
+	AWS_FOTA_EVT_RESUMED,
 	/** AWS FOTA Erase pending*/
 	AWS_FOTA_EVT_ERASE_PENDING,
 	/** AWS FOTA Erase done*/
@@ -84,6 +98,9 @@ int aws_fota_mqtt_evt_handler(struct mqtt_client *const client,
  *         null character) or a negative value on error.
  */
 int aws_fota_get_job_id(uint8_t *const job_id_buf, size_t buf_size);
+
+// Get the internal state.
+enum internal_state_t get_fota_internal_state(void);
 
 #ifdef __cplusplus
 }

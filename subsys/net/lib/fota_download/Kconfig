@@ -17,6 +17,10 @@ config FOTA_SOCKET_RETRIES
 	int "Number of retries for socket-related download issues"
 	default 2
 
+config FOTA_DOWNLOAD_RETRIES
+	int "Number of retries for overall download attempts."
+	default 5
+
 config FOTA_DOWNLOAD_PROGRESS_EVT
 	bool "Emit progress event upon receiving a download fragment"
 

@@ -201,6 +201,14 @@ static void aws_fota_cb_handler(struct aws_fota_event *fota_evt)
 		LOG_ERR("AWS_FOTA_EVT_ERROR");
 		aws_iot_evt.type = AWS_IOT_EVT_FOTA_ERROR;
 		break;
+	case AWS_FOTA_EVT_SUSPEND:
+		LOG_ERR("AWS_IOT_EVT_FOTA_SUSPEND");
+		aws_iot_evt.type = AWS_IOT_EVT_FOTA_SUSPEND;
+		break;
+	case AWS_FOTA_EVT_RESUMED:
+		LOG_ERR("AWS_FOTA_EVT_RESUMED");
+		aws_iot_evt.type = AWS_IOT_EVT_FOTA_RESUMED;
+		break;
 	case AWS_FOTA_EVT_DL_PROGRESS:
 		LOG_DBG("AWS_FOTA_EVT_DL_PROGRESS, (%d%%)",
 			fota_evt->dl.progress);
@@ -1214,11 +1222,20 @@ reset:
 	goto start;
 }
 
+/*
+ * To update this patch go to kt/src/embedded/ff/extern/ncs/nrf/ and run git fetch
+ * followed by git checkout main. Make changes to subsys/net/lib/aws_iot/src/aws_iot.c
+ * and then run the command:
+ * git diff subsys/net/lib/aws_iot/src/aws_iot.c > ../../../extern_patches/patches_aws_iot/0001-aws_iot_c.patch
+ * Commit the updated version of 0001-aws_iot_c.patch to ktmr.
+ */
+
 #ifdef CONFIG_BOARD_QEMU_X86
-#define POLL_THREAD_STACK_SIZE 4096
+#define POLL_THREAD_STACK_SIZE 6144
 #else
-#define POLL_THREAD_STACK_SIZE 3072
+#define POLL_THREAD_STACK_SIZE 6144
 #endif
+
 K_THREAD_DEFINE(aws_connection_poll_thread, POLL_THREAD_STACK_SIZE,
 		aws_iot_cloud_poll, NULL, NULL, NULL,
 		K_LOWEST_APPLICATION_THREAD_PRIO, 0, 0);
