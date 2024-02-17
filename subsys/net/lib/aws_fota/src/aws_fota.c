@@ -11,6 +11,8 @@
 #include <net/aws_jobs.h>
 #include <net/aws_fota.h>
 #include <zephyr/logging/log.h>
+#include <drivers/eeprom.h>
+#include <zephyr/sys/reboot.h>
 
 #include "aws_fota_json.h"
 
@@ -18,12 +20,14 @@ LOG_MODULE_REGISTER(aws_fota, CONFIG_AWS_FOTA_LOG_LEVEL);
 
 #define AWS_JOB_ID_DEFAULT "INVALID-JOB-ID"
 
-static enum internal_state {
-	STATE_UNINIT,
-	STATE_INIT,
-	STATE_DOWNLOADING,
-	STATE_DOWNLOAD_COMPLETE,
-} internal_state = STATE_UNINIT;
+// Keep in sync with ff_definitions.h in ff project
+#define EEPROM_ADDR_REBOOT_REASON (184)
+
+enum reset_reason_extra {
+	RESET_REASON_NONE = 0,
+	RESET_REASON_IOT = 1,
+	RESET_REASON_FOTA = 2
+};
 
 /* Enum used when parsing AWS jobs topics messages are received on. */
 enum jobs_topic {
@@ -59,6 +63,7 @@ static uint8_t get_topic[AWS_JOBS_TOPIC_MAX_LEN];
 
 /* Allocated buffers for keeping hostname, json payload and file_path. */
 static uint8_t payload_buf[CONFIG_AWS_FOTA_PAYLOAD_SIZE];
+static uint8_t protocol[sizeof("https://")];
 static uint8_t hostname[CONFIG_AWS_FOTA_HOSTNAME_MAX_LEN];
 static uint8_t file_path[CONFIG_AWS_FOTA_FILE_PATH_MAX_LEN];
 
@@ -66,24 +71,30 @@ static uint8_t file_path[CONFIG_AWS_FOTA_FILE_PATH_MAX_LEN];
 static uint8_t job_id_handling[AWS_JOBS_JOB_ID_MAX_LEN] = AWS_JOB_ID_DEFAULT;
 static aws_fota_callback_t callback;
 
+static enum internal_state_t internal_state = AWS_FOTA_STATE_UNINIT;
+
 /* Convenience functions used in internal state handling. */
-static char *state2str(enum internal_state state)
+static char *state2str(enum internal_state_t state)
 {
 	switch (state) {
-	case STATE_UNINIT:
-		return "STATE_UNINIT";
-	case STATE_INIT:
-		return "STATE_INIT";
-	case STATE_DOWNLOADING:
-		return "STATE_DOWNLOADING";
-	case STATE_DOWNLOAD_COMPLETE:
-		return "STATE_DOWNLOAD_COMPLETE";
+	case AWS_FOTA_STATE_UNINIT:
+		return "AWS_FOTA_STATE_UNINIT";
+	case AWS_FOTA_STATE_INIT:
+		return "AWS_FOTA_STATE_INIT";
+	case AWS_FOTA_STATE_DOWNLOADING:
+		return "AWS_FOTA_STATE_DOWNLOADING";
+	case AWS_FOTA_STATE_DOWNLOAD_COMPLETE:
+		return "AWS_FOTA_STATE_DOWNLOAD_COMPLETE";
+	case AWS_FOTA_STATE_ERROR:
+		return "AWS_FOTA_STATE_ERROR";
+	case AWS_FOTA_STATE_SUSPENDED:
+		return "AWS_FOTA_STATE_SUSPENDED";
 	default:
 		return "Unknown";
 	}
 }
 
-static void internal_state_set(enum internal_state new_state)
+static void internal_state_set(enum internal_state_t new_state)
 {
 	if (new_state == internal_state) {
 		LOG_DBG("State: %s", state2str(internal_state));
@@ -95,13 +106,18 @@ static void internal_state_set(enum internal_state new_state)
 	internal_state = new_state;
 }
 
+static void set_current_job_id(uint8_t *job_id)
+{
+	strncpy(job_id_handling, job_id, sizeof(job_id_handling));
+	job_id_handling[sizeof(job_id_handling) - 1] = '\0';
+}
+
 static void reset_library(void)
 {
-	internal_state_set(STATE_INIT);
+	internal_state_set(AWS_FOTA_STATE_INIT);
 	execution_status = AWS_JOBS_QUEUED;
 	download_progress = 0;
-	strncpy(job_id_handling, AWS_JOB_ID_DEFAULT, sizeof(job_id_handling));
-	job_id_handling[sizeof(job_id_handling) - 1] = '\0';
+	set_current_job_id(AWS_JOB_ID_DEFAULT);
 	LOG_DBG("Library reset");
 }
 
@@ -142,8 +158,7 @@ static enum jobs_topic topic_type_get(const char *incoming_topic, size_t topic_l
  *
  * @return 0 If successful otherwise a negative error code is returned.
  */
-static int get_published_payload(struct mqtt_client *client, uint8_t *write_buf,
-				 size_t length)
+static int get_published_payload(struct mqtt_client *client, uint8_t *write_buf, size_t length)
 {
 	uint8_t *buf = write_buf;
 	uint8_t *end = buf + length;
@@ -209,6 +224,28 @@ static int update_job_execution(struct mqtt_client *const client,
 }
 
 /**
+ * @brief Update the job document of the current job to AWS_JOBS_FAILED and move to ERROR state.
+ *
+ * @param client Connected MQTT client instance
+ *
+ * @return 0 If successful otherwise a negative error code is returned.
+ */
+static int set_current_job_failed(struct mqtt_client *const client)
+{
+	struct aws_fota_event aws_fota_evt = {
+		.id = AWS_FOTA_EVT_ERROR
+	};
+
+	callback(&aws_fota_evt);
+	internal_state_set(AWS_FOTA_STATE_ERROR);
+
+	return update_job_execution(client,
+				    job_id_handling,
+				    sizeof(job_id_handling),
+				    AWS_JOBS_FAILED, "");
+}
+
+/**
  * @brief Parsing an AWS IoT Job Execution response received on $next/get MQTT
  *	  topic or notify-next. If it is a valid response the program state is
  *	  updated and the MQTT client instance is subscribed to the update
@@ -220,12 +257,13 @@ static int update_job_execution(struct mqtt_client *const client,
  *
  * @return 0 If successful otherwise a negative error code is returned.
  */
-static int get_job_execution(struct mqtt_client *const client,
-			     uint32_t payload_len)
+static int parse_job_execution(struct mqtt_client *const client, uint32_t payload_len)
 {
 	int err;
 	int execution_version_number_prev = execution_version_number;
 	uint8_t job_id_incoming[AWS_JOBS_JOB_ID_MAX_LEN];
+	bool mark_job_as_complete = false;
+  bool mark_job_as_failed = false;
 
 	err = get_published_payload(client, payload_buf, payload_len);
 	if (err) {
@@ -243,17 +281,32 @@ static int get_job_execution(struct mqtt_client *const client,
 
 	/* Check if message received is a job. */
 	err = aws_fota_parse_DescribeJobExecution_rsp(payload_buf, payload_len,
-						      job_id_incoming, hostname,
-						      file_path,
-						      &execution_version_number);
+						      job_id_incoming,
+						      hostname, sizeof(hostname),
+						      file_path, sizeof(file_path),
+						      protocol, sizeof(protocol),
+						      &execution_version_number,
+									&mark_job_as_complete,
+									&mark_job_as_failed);
 
-	if (err < 0) {
-		LOG_ERR("Error when parsing the json: %d", err);
-		goto cleanup;
-	} else if (err == 0) {
+	// TODO: can we mark as complete and execute right away without needing the job update accepted to happen?
+	// this gives it the best chance of completion. (BUL REBOOT CASE ONLY)
+	enum execution_status exe_status = AWS_JOBS_FAILED;
+
+  if (err == AWS_FOTA_JSON_RES_IS_BULK_REBOOT)
+	{
+		// Continue.
+	}
+	else if (err == AWS_FOTA_JSON_RES_SKIPPED) {
 		LOG_DBG("Got only one field");
 		LOG_DBG("No queued jobs for this device");
 		return 0;
+	} else if ((err < 0) &&
+		   (err != AWS_FOTA_JSON_RES_INVALID_DOCUMENT) &&
+		   (err != AWS_FOTA_JSON_RES_URL_TOO_LONG)) {
+		LOG_ERR("Error when parsing the json: %d", err);
+		err = -ENODATA;
+		goto cleanup;
 	}
 
 	/* Check if the incoming job is already being handled. */
@@ -261,26 +314,59 @@ static int get_job_execution(struct mqtt_client *const client,
 		LOG_WRN("Job already being handled, ignore message");
 		err = 0;
 		goto cleanup;
-	} else {
-		strncpy(job_id_handling, job_id_incoming, sizeof(job_id_handling));
-		job_id_handling[sizeof(job_id_handling) - 1] = '\0';
 	}
 
+	set_current_job_id(job_id_incoming);
+
+	/* Check if the update data is valid */
+	if (err == AWS_FOTA_JSON_RES_INVALID_DOCUMENT) {
+		LOG_ERR("Invalid FOTA update document: %d", err);
+		return set_current_job_failed(client);
+	} else if (err == AWS_FOTA_JSON_RES_URL_TOO_LONG) {
+		LOG_ERR("URL elements too long for buffer: %d", err);
+		return set_current_job_failed(client);
+	}
+
+	/* Valid update */
 	LOG_DBG("Job ID: %s", (char *)job_id_handling);
+	LOG_DBG("protocol: %s", (char *)protocol);
 	LOG_DBG("hostname: %s", (char *)hostname);
 	LOG_DBG("file_path %s", (char *)file_path);
 	LOG_DBG("execution_version_number: %d ", execution_version_number);
 
-	/* Subscribe to update topic to receive feedback on whether an
-	 * update is accepted or not.
-	 */
-	err = aws_jobs_subscribe_topic_update(client, job_id_handling, update_topic);
-	if (err) {
-		LOG_ERR("Error when subscribing job_id_update: %d", err);
-		goto cleanup;
+
+	if (mark_job_as_complete)
+	{
+		LOG_ERR("Marking Job as Complete jobid %s", job_id_handling);
+		exe_status = AWS_JOBS_SUCCEEDED;
+	}
+	else if (mark_job_as_failed)
+	{
+		LOG_ERR("Marking Job as Failed jobid %s", job_id_handling);
+		return set_current_job_failed(client);
+	}
+	else
+	{
+		exe_status = AWS_JOBS_IN_PROGRESS;
 	}
 
-	LOG_DBG("Subscribed to FOTA update topic %s", (char *)update_topic);
+	err = update_job_execution(client,
+				   job_id_handling,
+				   sizeof(job_id_handling),
+				   exe_status,
+				   "");
+
+	if (err) {
+		LOG_ERR("update_job_execution failed, error: %d", err);
+		return err;
+	}
+	else if (exe_status == AWS_JOBS_SUCCEEDED)
+	{
+		// In this case we are immediately marking the job as complete, and so now we reset to await a new one.
+		LOG_DBG("Reset Library due to Job Marked SUCCEEDED.");
+		reset_library();
+	}
+
 	return 0;
 
 cleanup:
@@ -297,8 +383,7 @@ cleanup:
  *
  * @return 0 If successful otherwise a negative error code is returned.
  */
-static int job_update_accepted(struct mqtt_client *const client,
-			       uint32_t payload_len)
+static int job_update_accepted(struct mqtt_client *const client, uint32_t payload_len)
 {
 	int err;
 	int sec_tag = -1;
@@ -316,9 +401,20 @@ static int job_update_accepted(struct mqtt_client *const client,
 	 * document.
 	 */
 	execution_version_number++;
+	LOG_DBG("Execution version number icremented to: %d", execution_version_number);
 
 	switch (execution_status) {
 	case AWS_JOBS_IN_PROGRESS: {
+		if (strncmp(job_id_handling, "bulk-reboot", strlen("bulk-reboot")) == 0)
+		{
+			// If the job id is "bulk-reboot", update the status to complete and return
+			internal_state_set(AWS_FOTA_STATE_DOWNLOAD_COMPLETE);
+			return update_job_execution(client,
+										job_id_handling,
+										sizeof(job_id_handling),
+										AWS_JOBS_SUCCEEDED, "");
+		}
+
 		struct aws_fota_event aws_fota_evt = {
 			.id = AWS_FOTA_EVT_START
 		};
@@ -326,30 +422,75 @@ static int job_update_accepted(struct mqtt_client *const client,
 		LOG_DBG("Start downloading firmware from %s/%s",
 			(char *)hostname, (char *)file_path);
 
-#if defined(CONFIG_AWS_FOTA_DOWNLOAD_SECURITY_TAG)
-		sec_tag = CONFIG_AWS_FOTA_DOWNLOAD_SECURITY_TAG;
-#endif
+		/* If the protocol is https set the sec_tag. This instructs the download client
+		 * to use https. Fail if the protocol is https but no sec tag is configured.
+		 */
+		if (strncmp(protocol, "https", 5) == 0) {
+			if (CONFIG_AWS_FOTA_DOWNLOAD_SECURITY_TAG == -1) {
+				LOG_ERR("Trying to use https without sec tag configured.");
+				return set_current_job_failed(client);
+			}
+
+			sec_tag = CONFIG_AWS_FOTA_DOWNLOAD_SECURITY_TAG;
+		}
 
 		err = fota_download_start(hostname, file_path, sec_tag, 0, 0);
 		if (err) {
 			LOG_ERR("Error (%d) when trying to start firmware download", err);
-			aws_fota_evt.id = AWS_FOTA_EVT_ERROR;
-			callback(&aws_fota_evt);
-			return update_job_execution(client,
-						    job_id_handling,
-						    sizeof(job_id_handling),
-						    AWS_JOBS_FAILED, "");
+			return set_current_job_failed(client);
 		}
 
-		internal_state_set(STATE_DOWNLOADING);
+		internal_state_set(AWS_FOTA_STATE_DOWNLOADING);
 		callback(&aws_fota_evt);
 		LOG_DBG("Job document was updated with status IN_PROGRESS");
 	}
 		break;
 	case AWS_JOBS_SUCCEEDED: {
 		struct aws_fota_event aws_fota_evt = {
-			.id = AWS_FOTA_EVT_DONE
+			.id = AWS_FOTA_EVT_DONE,
+			.image = fota_download_target()
 		};
+
+		if (strncmp(job_id_handling, "bulk-reboot", strlen("bulk-reboot")) == 0)
+		{
+			// Once the bulk-reboot job was marked as succeeded on AWS, reboot the system
+			int eeprom_val = RESET_REASON_IOT;
+			const struct device *eeprom_dev = device_get_binding("EEPROM_0");
+			if (eeprom_dev == NULL)
+			{
+				LOG_ERR("Could not get EEPROM device\n");
+			}
+			else
+			{
+				if (eeprom_write(eeprom_dev, EEPROM_ADDR_REBOOT_REASON, &eeprom_val, sizeof(eeprom_val)) != 0)
+				{
+					LOG_ERR("Failed to write reboot reason to EEPROM");
+				}
+			}
+			LOG_INF("System is rebooting!");
+			sys_reboot(SYS_REBOOT_COLD);
+			break;
+		}
+
+		const struct device *eeprom_dev = device_get_binding("EEPROM_0");
+
+		// Write to eeprom so we know why we rebooted
+		if (eeprom_dev == NULL)
+		{
+			LOG_ERR("Could not get EEPROM device\n");
+		}
+		else
+		{
+			int eeprom_val = RESET_REASON_FOTA;
+			if (eeprom_write(eeprom_dev, EEPROM_ADDR_REBOOT_REASON, &eeprom_val, sizeof(eeprom_val)) != 0)
+			{
+				LOG_ERR("Failed to write reboot reason to EEPROM");
+			}
+			else
+			{
+				LOG_INF("Write eeprom reset reason FOTA");
+			}
+		}
 
 		LOG_DBG("Job document was updated with status SUCCEEDED");
 		LOG_DBG("Ready to reboot");
@@ -358,6 +499,13 @@ static int job_update_accepted(struct mqtt_client *const client,
 		/* Job is compeleted, reset library. */
 		reset_library();
 	}
+		break;
+	case AWS_JOBS_FAILED:
+		LOG_DBG("Job document was updated with status FAILED");
+		reset_library();
+
+		/* Ignore return value since error does not need to be handled. */
+		(void)aws_jobs_get_job_execution(client_internal, "$next", get_topic);
 		break;
 	default:
 		LOG_ERR("Invalid execution status");
@@ -376,12 +524,12 @@ static int job_update_accepted(struct mqtt_client *const client,
  *
  * @return A negative error code is returned.
  */
-static int job_update_rejected(struct mqtt_client *const client,
-			       uint32_t payload_len)
+static int job_update_rejected(struct mqtt_client *const client, uint32_t payload_len)
 {
 	struct aws_fota_event aws_fota_evt = { .id = AWS_FOTA_EVT_ERROR };
 	LOG_ERR("Job document update was rejected");
 	execution_version_number--;
+	LOG_DBG("Execution version number decremented to: %d", execution_version_number);
 	int err = get_published_payload(client, payload_buf, payload_len);
 
 	if (err) {
@@ -389,6 +537,22 @@ static int job_update_rejected(struct mqtt_client *const client,
 		return err;
 	}
 	LOG_ERR("%s", (char *)payload_buf);
+
+	LOG_DBG("Payload:");
+	LOG_HEXDUMP_ERR(payload_buf, payload_len, "");
+
+	// If error was "VersionMismatch" then sychnronize to expectation now!
+	int version_in_response = 0;
+	if (aws_fota_parse_update_rejected(payload_buf, payload_len, &version_in_response) >= 0)
+	{
+		if (version_in_response != execution_version_number)
+		{
+			LOG_ERR("VersionNumber was out of synch, expected: %d, had: %d", version_in_response, (execution_version_number+1));
+			LOG_INF("Setting Execution version number to: %d", version_in_response);
+			execution_version_number = version_in_response;
+		}
+	}
+
 	callback(&aws_fota_evt);
 	return -EFAULT;
 }
@@ -442,15 +606,16 @@ static int on_publish_evt(struct mqtt_client *const client,
 	case TOPIC_GET_NEXT:
 	case TOPIC_GET_ACCEPTED:
 	case TOPIC_NOTIFY_NEXT:
-		if (internal_state != STATE_INIT) {
+		if (internal_state != AWS_FOTA_STATE_INIT) {
 			goto read_payload;
 		}
 
 		LOG_DBG("Checking for an available job");
-		return get_job_execution(client, payload_len);
+		return parse_job_execution(client, payload_len);
 	case TOPIC_UPDATE_ACCEPTED:
-		if (internal_state != STATE_INIT &&
-		    internal_state != STATE_DOWNLOAD_COMPLETE) {
+		if (internal_state != AWS_FOTA_STATE_INIT &&
+		    internal_state != AWS_FOTA_STATE_DOWNLOAD_COMPLETE &&
+		    internal_state != AWS_FOTA_STATE_ERROR) {
 			goto read_payload;
 		}
 
@@ -461,8 +626,9 @@ static int on_publish_evt(struct mqtt_client *const client,
 
 		return job_update_accepted(client, payload_len);
 	case TOPIC_UPDATE_REJECTED:
-		if (internal_state != STATE_INIT &&
-		    internal_state != STATE_DOWNLOAD_COMPLETE) {
+		if (internal_state != AWS_FOTA_STATE_INIT &&
+		    internal_state != AWS_FOTA_STATE_DOWNLOAD_COMPLETE &&
+		    internal_state != AWS_FOTA_STATE_ERROR) {
 			goto read_payload;
 		}
 
@@ -498,9 +664,11 @@ read_payload:
 static int on_connack_evt(struct mqtt_client *const client)
 {
 	int err;
+	enum execution_status status;
+	struct aws_fota_event aws_fota_evt;
 
 	switch (internal_state) {
-	case STATE_INIT:
+	case AWS_FOTA_STATE_INIT:
 		err = aws_jobs_subscribe_topic_notify_next(client, notify_next_topic);
 		if (err) {
 			LOG_ERR("Unable to subscribe to notify-next topic");
@@ -512,24 +680,46 @@ static int on_connack_evt(struct mqtt_client *const client)
 			LOG_ERR("Unable to subscribe to jobs/$next/get");
 			return err;
 		}
-		break;
-	case STATE_DOWNLOADING:
-		/* Fall through */
-	case STATE_DOWNLOAD_COMPLETE:
-		if (strncmp(job_id_handling, AWS_JOB_ID_DEFAULT, sizeof(job_id_handling)) == 0) {
-			return -ECANCELED;
-		}
 
-		err = aws_jobs_subscribe_topic_update(client, job_id_handling, update_topic);
-		if (err) {
-			LOG_ERR("Error when subscribing job_id_update: %d", err);
-			return err;
-		}
-
-		LOG_DBG("Subscribed to FOTA update topic %s", (char *)update_topic);
+		status = AWS_JOBS_IN_PROGRESS;
 		break;
+	case AWS_FOTA_STATE_DOWNLOAD_COMPLETE:
+		status = AWS_JOBS_SUCCEEDED;
+		break;
+	case AWS_FOTA_STATE_ERROR:
+		status = AWS_JOBS_FAILED;
+		break;
+	case AWS_FOTA_STATE_SUSPENDED:
+		// Trigger a resume download...
+		if (fota_download_resume() < 0 && connected)
+		{
+			aws_fota_evt.id = AWS_FOTA_EVT_ERROR;
+			callback(&aws_fota_evt);
+			reset_library();
+			LOG_ERR("FOTA RESUME FAILED");
+			return -EAGAIN;
+		}
+		else
+		{
+			// Go back to downloading state.
+			internal_state_set(AWS_FOTA_STATE_DOWNLOADING);
+			return 0;
+		}
 	default:
-		break;
+		return 0;
+	}
+
+	/* If we have just reconnected, we might already be handling a job.
+	 * Check if this is the case and update the job status accordingly.
+	 */
+	if (strncmp(job_id_handling, AWS_JOB_ID_DEFAULT, sizeof(job_id_handling)) == 0) {
+		return 0;
+	}
+
+	err = update_job_execution(client, job_id_handling, sizeof(job_id_handling), status, "");
+	if (err) {
+		LOG_ERR("update_job_execution failed, error: %d", err);
+		return err;
 	}
 
 	return 0;
@@ -558,51 +748,25 @@ static int on_suback_evt(struct mqtt_client *const client, uint16_t message_id)
 		break;
 	case SUBSCRIBE_JOB_ID_UPDATE:
 		LOG_DBG("Subscribed to job ID update accepted/rejected topics");
-
-		enum execution_status status;
-
-		switch (internal_state) {
-		case STATE_INIT:
-			status = AWS_JOBS_IN_PROGRESS;
-			break;
-		case STATE_DOWNLOAD_COMPLETE:
-			status = AWS_JOBS_SUCCEEDED;
-			break;
-		case STATE_DOWNLOADING:
-			return 0;
-		default:
-			LOG_WRN("Invalid state");
-			return -ECANCELED;
-		}
-
-		err = update_job_execution(client,
-					   job_id_handling,
-					   sizeof(job_id_handling),
-					   status,
-					   "");
-		if (err) {
-			LOG_ERR("update_job_execution failed, error: %d", err);
-			return err;
-		}
-
 		break;
 	default:
 		/* Message ID not related to AWS FOTA. */
-		break;
+		return 1;
 	} /* end switch(message_id) */
 
 	return 0;
 }
 
-int aws_fota_mqtt_evt_handler(struct mqtt_client *const client,
-			      const struct mqtt_evt *evt)
+int aws_fota_mqtt_evt_handler(struct mqtt_client *const client, const struct mqtt_evt *evt)
 {
 	int err;
 
-	if (internal_state == STATE_UNINIT) {
+	if (internal_state == AWS_FOTA_STATE_UNINIT) {
 		LOG_WRN("AWS FOTA library not initialized");
 		return -ENOENT;
 	}
+
+	client_internal = client;
 
 	switch (evt->type) {
 	case MQTT_EVT_CONNACK:
@@ -675,12 +839,14 @@ int aws_fota_mqtt_evt_handler(struct mqtt_client *const client,
 		}
 
 		err = on_suback_evt(client, evt->param.suback.message_id);
-		if (err) {
+		if (err < 0) {
 			LOG_WRN("on_suback_evt, error: %d", err);
 			goto cleanup;
+		} else if (err == 1) {
+			return err;
 		}
 
-		return 1;
+		return 0;
 
 	default:
 		/* Handling for default case */
@@ -720,13 +886,18 @@ static void http_fota_handler(const struct fota_download_evt *evt)
 			return;
 		}
 
-		internal_state_set(STATE_DOWNLOAD_COMPLETE);
+		internal_state_set(AWS_FOTA_STATE_DOWNLOAD_COMPLETE);
 		break;
 
 	case FOTA_DOWNLOAD_EVT_ERASE_PENDING:
 		LOG_DBG("FOTA_DOWNLOAD_EVT_ERASE_PENDING");
 		aws_fota_evt.id = AWS_FOTA_EVT_ERASE_PENDING;
 		callback(&aws_fota_evt);
+		break;
+
+	case FOTA_DOWNLOAD_EVT_ERASE_TIMEOUT:
+		LOG_DBG("FOTA_DOWNLOAD_EVT_ERASE_TIMEOUT");
+		/* The erasure continues. */
 		break;
 
 	case FOTA_DOWNLOAD_EVT_ERASE_DONE:
@@ -737,21 +908,11 @@ static void http_fota_handler(const struct fota_download_evt *evt)
 
 	case FOTA_DOWNLOAD_EVT_ERROR:
 		LOG_ERR("FOTA_DOWNLOAD_EVT_ERROR");
-		(void)update_job_execution(client_internal,
-					   job_id_handling,
-					   sizeof(job_id_handling),
-					   AWS_JOBS_FAILED,
-					   "");
 
-		aws_fota_evt.id = AWS_FOTA_EVT_ERROR;
-
-		callback(&aws_fota_evt);
-		reset_library();
-
-		/* If the FOTA download fails it might be due to the image being deleted.
-		 * Try to get the next job if any exist.
-		 */
-		(void)aws_jobs_get_job_execution(client_internal, "$next", get_topic);
+		err = set_current_job_failed(client_internal);
+		if (err < 0) {
+			reset_library();
+		}
 		break;
 
 	case FOTA_DOWNLOAD_EVT_PROGRESS:
@@ -764,28 +925,41 @@ static void http_fota_handler(const struct fota_download_evt *evt)
 		callback(&aws_fota_evt);
 		break;
 
+	case FOTA_DOWNLOAD_EVT_SUSPENDED:
+		// Set Internal State To Suspended...
+		LOG_INF("FOTA_DOWNLOAD_EVT_SUSPENDED, JOB ID: %s - NUM: %d", job_id_handling, execution_version_number);
+		internal_state_set(AWS_FOTA_STATE_SUSPENDED);
+		// Puble the suspend up...
+		aws_fota_evt.id = AWS_FOTA_EVT_SUSPEND;
+		callback(&aws_fota_evt);
+		break;
+	case FOTA_DOWNLOAD_EVT_RESUMED:
+		// Set Internal State To Suspended...
+		LOG_INF("FOTA_DOWNLOAD_EVT_RESUMED, JOB ID: %s - NUM: %d", job_id_handling, execution_version_number);
+		// Bubble the suspend up...
+		aws_fota_evt.id = AWS_FOTA_EVT_RESUMED;
+		callback(&aws_fota_evt);
+	break;
+
 	default:
 		LOG_WRN("Unhandled FOTA event ID: %d", evt->id);
 		break;
 	}
 }
 
-int aws_fota_init(struct mqtt_client *const client,
-		  aws_fota_callback_t evt_handler)
+int aws_fota_init(struct mqtt_client *const client, aws_fota_callback_t evt_handler)
 {
 	int err;
 
-	if (internal_state != STATE_UNINIT) {
+	if (evt_handler == NULL) {
+		return -EINVAL;
+	}
+
+	if (internal_state != AWS_FOTA_STATE_UNINIT) {
 		LOG_WRN("AWS FOTA library has already been initialized");
 		return -EPERM;
 	}
 
-	if (client == NULL || evt_handler == NULL) {
-		return -EINVAL;
-	}
-
-	/* Store client to make it available in event handlers. */
-	client_internal = client;
 	callback = evt_handler;
 
 	err = fota_download_init(http_fota_handler);
@@ -794,7 +968,7 @@ int aws_fota_init(struct mqtt_client *const client,
 		return err;
 	}
 
-	internal_state_set(STATE_INIT);
+	internal_state_set(AWS_FOTA_STATE_INIT);
 	return 0;
 }
 
@@ -804,4 +978,9 @@ int aws_fota_get_job_id(uint8_t *const job_id_buf, size_t buf_size)
 		return -EINVAL;
 	}
 	return snprintf(job_id_buf, buf_size, "%s", (char *)job_id_handling);
+}
+
+enum internal_state_t get_fota_internal_state(void)
+{
+	return internal_state;
 }

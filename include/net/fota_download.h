@@ -37,12 +37,18 @@ enum fota_download_evt_id {
 	FOTA_DOWNLOAD_EVT_FINISHED,
 	/** FOTA download erase pending. */
 	FOTA_DOWNLOAD_EVT_ERASE_PENDING,
+	// Deletion timed out.
+	FOTA_DOWNLOAD_EVT_ERASE_TIMEOUT,
 	/** FOTA download erase done. */
 	FOTA_DOWNLOAD_EVT_ERASE_DONE,
 	/** FOTA download error. */
 	FOTA_DOWNLOAD_EVT_ERROR,
 	/** FOTA download cancelled. */
-	FOTA_DOWNLOAD_EVT_CANCELLED
+	FOTA_DOWNLOAD_EVT_CANCELLED,
+	/** FOTA download suspended. */
+	FOTA_DOWNLOAD_EVT_SUSPENDED,
+	// FOTA Resumed.
+	FOTA_DOWNLOAD_EVT_RESUMED
 };
 
 /**
@@ -152,6 +158,22 @@ int fota_download_start_with_image_type(const char *host, const char *file,
  */
 int fota_download_cancel(void);
 
+/**@brief Suspend FOTA image downloading.
+ *
+ * @retval 0       If FOTA download is suspended successfully.
+ * @retval -EAGAIN If download is not started, aborted or completed.
+ *                 Otherwise, a negative value is returned.
+ */
+int fota_download_suspend(void);
+
+/**@brief Suspend FOTA image resume.
+ *
+ * @retval 0       If FOTA download is resumed successfully.
+ * @retval -EAGAIN If download is not started, aborted or completed.
+ *                 Otherwise, a negative value is returned.
+ */
+int fota_download_resume(void);
+
 /**@brief Get target image type.
  *
  * Image type becomes known after download starts.
@@ -169,6 +191,17 @@ int fota_download_target(void);
  *           Otherwise, a (negative) error code is returned.
  */
 int fota_download_s0_active_get(bool *const s0_active);
+
+/**@brief Get fota download attempt count.
+ *
+ *  Returns -1 before download starts.
+ *
+ * @retval -1 before download starts. Count thereafter.
+ */
+int fota_download_get_attempt_count(void);
+
+// Inform the fota download module when cable power is connected or not.
+int fota_inform_ext_power_status(bool b_is_connected);
 
 #ifdef __cplusplus
 }
