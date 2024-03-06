@@ -318,12 +318,14 @@ static int client_connect(struct download_client *dl)
 		dl->fd, addrlen, str_family(dl->remote_addr.sa_family), port);
 
 	err = connect(dl->fd, &dl->remote_addr, addrlen);
+
 	if (err) {
 		LOG_ERR("Unable to connect, errno %d", errno);
 		err = -errno;
 	}
 
 cleanup:
+	LOG_INF("Connect %s.", err ? "FAILED": "SUCCEEDED");
 	if (err) {
 		/* Unable to connect, close socket */
 		close(dl->fd);
@@ -493,10 +495,50 @@ restart_and_suspend:
 			break;
 		}
 
-		LOG_DBG("Receiving up to %d bytes at %p...",
-			(sizeof(dl->buf) - dl->offset), (dl->buf + dl->offset));
+		LOG_DBG("Receiving up to %d bytes at %u...",
+			(sizeof(dl->buf) - dl->offset), (uint32_t) (dl->buf + dl->offset));
 
 		len = socket_recv(dl);
+
+
+		// THIS IS FOR TESTING ONLY!
+		// static uint32_t last_fake_error = 1;
+		// if (((dl->progress % (1024*50)) == 0) && (dl->progress > 0) && (last_fake_error != dl->progress))
+		// {
+		// 	LOG_ERR("TRIGGER AN ERROR FOR TESTING PURPOSES...");
+		// 	error_cause = ETIMEDOUT;
+		// 	last_fake_error = dl->progress;
+		// 	if ((len == 0) || (len == -1))
+		// 	{
+		//
+		// 		if ((dl->offset > 0) && (dl->http.has_header)) {
+		// 			rc = fragment_evt_send(dl);
+		// 			if (rc) {
+		// 				/* Restart and suspend */
+		// 				LOG_INF("Fragment refused, download stopped.");
+		// 				break;
+		// 			}
+		// 		}
+		//
+		// 	}
+		//
+		// 	rc = error_evt_send(dl, error_cause);
+		// 	if (rc)
+		// 	{
+		// 		/* Restart and suspend */
+		// 		break;
+		// 	}
+		//
+		// 	rc = reconnect(dl);
+		// 	if (rc)
+		// 	{
+		// 		// error_evt_send(dl, EHOSTDOWN);
+		// 		break;
+		// 	}
+		//
+		// 	goto send_again;
+		// }
+		// END TEST ERROR BLOCK
 
 		if ((len == 0) || (len == -1)) {
 			/* We just had an unexpected socket error or closure */
@@ -753,12 +795,28 @@ int download_client_start(struct download_client *client, const char *file,
 		}
 	}
 
+	// TODO: mjones
+	// Check the RSRP and BATT REMAINING
+	// if insufficient, return err.
+
 	err = request_send(client);
 	if (err) {
 		return err;
 	}
 
-	LOG_INF("Downloading: %s [%u]", client->file, client->progress);
+#if IS_ENABLED(CONFIG_DOWNLOAD_CLIENT_LOG_LEVEL_DBG)
+	if (strlen(client->file) > 120) {
+		/* '?' is the URL parameter marker */
+		char *q = strchr(client->file, '?');
+		size_t len = MIN(120, q - client->file + 1);
+		uint8_t truncated[len + 4];
+		memcpy(truncated, client->file, len);
+		memcpy(&truncated[len], "...\0", 4);
+		LOG_INF("Downloading: %s [%u]", truncated, client->progress);
+	} else {
+		LOG_INF("Downloading: %s [%u]", client->file, client->progress);
+	}
+#endif
 
 	/* Let the thread run */
 	k_thread_resume(client->tid);
