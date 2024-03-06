@@ -35,7 +35,9 @@ if(CONFIG_BOOTLOADER_MCUBOOT)
     return()
   endif()
 
+  include(${ZEPHYR_BASE}/../nrf/cmake/extensions.cmake)
   include(${ZEPHYR_BASE}/../nrf/cmake/fw_zip.cmake)
+  include(${ZEPHYR_BASE}/../nrf/cmake/multi_image.cmake)
   include(${ZEPHYR_BASE}/../nrf/cmake/dfu_multi_image.cmake)
 
   function(sign)
