@@ -107,6 +107,10 @@ enum aws_iot_evt_type {
 	 *  errors and FOTA errors, so they can be handled differently.
 	 */
 	AWS_IOT_EVT_FOTA_ERROR,
+	// Fota Suspended.
+	AWS_IOT_EVT_FOTA_SUSPEND,
+	// Fota Resumed
+	AWS_IOT_EVT_FOTA_RESUMED,
 	/** AWS IoT library irrecoverable error. */
 	AWS_IOT_EVT_ERROR
 };
