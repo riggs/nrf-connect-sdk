@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 
+include_guard(GLOBAL)
 #
 # Helper macro for verifying that at least one of the required arguments has
 # been provided by the caller.

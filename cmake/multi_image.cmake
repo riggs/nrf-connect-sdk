@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 
+include_guard(GLOBAL)
+
 if(SYSBUILD)
   # Sysbuild and child-image are mutual exclusive, so if sysbuild is used disable child-image
   function(add_child_image)
